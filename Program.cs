@@ -67,59 +67,61 @@ public class TransformerWeights
 
     public float[] TokenEmbeddingTable { get; }
 
-    public TransformerWeights(Config p, ReadOnlyMemory<byte> memory)
+    // --- ИЗМЕНЕНИЕ ---
+    // Конструктор теперь принимает MemoryMappedViewAccessor и начальное смещение,
+    // а не массив байт. Это позволяет читать данные напрямую из файла.
+    public TransformerWeights(Config p, MemoryMappedViewAccessor accessor)
     {
-        var offset = 0;
+        long offset = 256; // Веса начинаются после заголовка (256 байт)
+
+        RmsAttWeight = ReadFloats(accessor, ref offset, p.n_layers * p.dim);
+        RmsFfnWeight = ReadFloats(accessor, ref offset, p.n_layers * p.dim);
+        RmsFinalWeight = ReadFloats(accessor, ref offset, p.dim);
+        QLnWeights = ReadFloats(accessor, ref offset, p.n_layers * p.head_dim);
+        KLnWeights = ReadFloats(accessor, ref offset, p.n_layers * p.head_dim);
+
+        QTokens = ReadQuantizedTensors(accessor, ref offset, 1, p.vocab_size * p.dim)[0];
+        Wq = ReadQuantizedTensors(accessor, ref offset, p.n_layers, p.dim * (p.n_heads * p.head_dim));
+        Wk = ReadQuantizedTensors(accessor, ref offset, p.n_layers, p.dim * (p.n_kv_heads * p.head_dim));
+        Wv = ReadQuantizedTensors(accessor, ref offset, p.n_layers, p.dim * (p.n_kv_heads * p.head_dim));
+        Wo = ReadQuantizedTensors(accessor, ref offset, p.n_layers, (p.n_heads * p.head_dim) * p.dim);
+        W1 = ReadQuantizedTensors(accessor, ref offset, p.n_layers, p.dim * p.hidden_dim);
+        W2 = ReadQuantizedTensors(accessor, ref offset, p.n_layers, p.hidden_dim * p.dim);
+        W3 = ReadQuantizedTensors(accessor, ref offset, p.n_layers, p.dim * p.hidden_dim);
         
-        RmsAttWeight = ReadFloats(ref memory, ref offset, p.n_layers * p.dim);
-        RmsFfnWeight = ReadFloats(ref memory, ref offset, p.n_layers * p.dim);
-        RmsFinalWeight = ReadFloats(ref memory, ref offset, p.dim);
-        QLnWeights = ReadFloats(ref memory, ref offset, p.n_layers * p.head_dim);
-        KLnWeights = ReadFloats(ref memory, ref offset, p.n_layers * p.head_dim);
-
-        QTokens = ReadQuantizedTensors(ref memory, ref offset, 1, p.vocab_size * p.dim)[0];
-        Wq = ReadQuantizedTensors(ref memory, ref offset, p.n_layers, p.dim * (p.n_heads * p.head_dim));
-        Wk = ReadQuantizedTensors(ref memory, ref offset, p.n_layers, p.dim * (p.n_kv_heads * p.head_dim));
-        Wv = ReadQuantizedTensors(ref memory, ref offset, p.n_layers, p.dim * (p.n_kv_heads * p.head_dim));
-        Wo = ReadQuantizedTensors(ref memory, ref offset, p.n_layers, (p.n_heads * p.head_dim) * p.dim);
-        W1 = ReadQuantizedTensors(ref memory, ref offset, p.n_layers, p.dim * p.hidden_dim);
-        W2 = ReadQuantizedTensors(ref memory, ref offset, p.n_layers, p.hidden_dim * p.dim);
-        W3 = ReadQuantizedTensors(ref memory, ref offset, p.n_layers, p.dim * p.hidden_dim);
-
         Wcls = p.IsSharedClassifier
             ? QTokens
-            : ReadQuantizedTensors(ref memory, ref offset, 1, p.dim * p.vocab_size)[0];
+            : ReadQuantizedTensors(accessor, ref offset, 1, p.dim * p.vocab_size)[0];
 
         TokenEmbeddingTable = new float[p.vocab_size * p.dim];
         Dequantize(QTokens, TokenEmbeddingTable.AsSpan());
     }
 
-    private static float[] ReadFloats(ref ReadOnlyMemory<byte> memory, ref int offset, int count)
+    // --- ИЗМЕНЕНИЕ ---
+    // Метод переписан для чтения напрямую из MemoryMappedViewAccessor.
+    private static float[] ReadFloats(MemoryMappedViewAccessor accessor, ref long offset, int count)
     {
-        var slice = memory.Slice(offset, count * sizeof(float));
-        offset += count * sizeof(float);
         var floatArray = new float[count];
-        MemoryMarshal.Cast<byte, float>(slice.Span).CopyTo(floatArray);
+        accessor.ReadArray(offset, floatArray, 0, count);
+        offset += (long)count * sizeof(float);
         return floatArray;
     }
-
-    private static QuantizedTensor[] ReadQuantizedTensors(ref ReadOnlyMemory<byte> memory, ref int offset, int numTensors, int tensorSize)
+    
+    // --- ИЗМЕНЕНИЕ ---
+    // Метод переписан для чтения напрямую из MemoryMappedViewAccessor.
+    private static QuantizedTensor[] ReadQuantizedTensors(MemoryMappedViewAccessor accessor, ref long offset, int numTensors, int tensorSize)
     {
         var tensors = new QuantizedTensor[numTensors];
         for (int i = 0; i < numTensors; i++)
         {
-            var qMem = memory.Slice(offset, tensorSize);
+            var qArray = new sbyte[tensorSize];
+            accessor.ReadArray(offset, qArray, 0, tensorSize);
             offset += tensorSize;
 
             int scalesSize = tensorSize / Globals.GS;
-            var sMem = memory.Slice(offset, scalesSize * sizeof(float));
-            offset += scalesSize * sizeof(float);
-
-            var qArray = new sbyte[tensorSize];
-            MemoryMarshal.Cast<byte, sbyte>(qMem.Span).CopyTo(qArray);
-            
             var sArray = new float[scalesSize];
-            MemoryMarshal.Cast<byte, float>(sMem.Span).CopyTo(sArray);
+            accessor.ReadArray(offset, sArray, 0, scalesSize);
+            offset += (long)scalesSize * sizeof(float);
 
             tensors[i] = new QuantizedTensor(qArray, sArray);
         }
@@ -182,45 +184,50 @@ public class Transformer : IDisposable
     public Config Config { get; }
     private TransformerWeights Weights { get; }
     private RunState State { get; }
-    private MemoryMappedFile? _mmf; 
+    
+    // --- ИЗМЕНЕНИЕ ---
+    // Храним ссылки на MemoryMappedFile и Accessor, чтобы они не были уничтожены
+    // сборщиком мусора, пока мы с ними работаем.
+    private MemoryMappedFile _mmf; 
+    private MemoryMappedViewAccessor _accessor;
 
     public Transformer(string checkpointPath, int ctxLength)
     {
+        // --- ИЗМЕНЕНИЕ ---
+        // Полностью переписан конструктор для безопасной работы с большими файлами.
         _mmf = MemoryMappedFile.CreateFromFile(checkpointPath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
-        using var accessor = _mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
+        _accessor = _mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
         
-        unsafe
+        // Читаем конфигурацию из начала файла
+        var configBytes = new byte[Unsafe.SizeOf<Config>()];
+        _accessor.ReadArray(0, configBytes, 0, configBytes.Length);
+        Config = MemoryMarshal.Read<Config>(configBytes);
+
+        if (Config.magic_number != 0x616a6331)
+            throw new InvalidDataException($"File {checkpointPath} is not a qwen3.c checkpoint");
+        if (Config.version != 1)
+            throw new InvalidDataException($"Checkpoint {checkpointPath} is version {Config.version}, expected 1");
+        
+        if (ctxLength > 0 && ctxLength <= Config.seq_len)
         {
-            byte* ptr = null;
-            accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);
-            
-            Config = MemoryMarshal.Read<Config>(new ReadOnlySpan<byte>(ptr, Unsafe.SizeOf<Config>()));
-            
-            if (Config.magic_number != 0x616a6331)
-                throw new InvalidDataException($"File {checkpointPath} is not a qwen3.c checkpoint");
-            if (Config.version != 1)
-                throw new InvalidDataException($"Checkpoint {checkpointPath} is version {Config.version}, expected 1");
-            
-            if (ctxLength > 0 && ctxLength <= Config.seq_len)
-            {
-                Config = Config with { seq_len = ctxLength };
-            }
-            
-            Globals.GS = Config.group_size;
-
-            var weightsMemory = new ReadOnlySpan<byte>(ptr + 256, (int)(accessor.Capacity - 256)).ToArray();
-            Weights = new TransformerWeights(Config, weightsMemory);
-
-            accessor.SafeMemoryMappedViewHandle.ReleasePointer();
+            Config = Config with { seq_len = ctxLength };
         }
+        
+        Globals.GS = Config.group_size;
+        
+        // Создаем веса, передавая accessor, который обеспечивает прямой доступ к файлу.
+        // Больше не нужно копировать гигабайты данных в массив.
+        Weights = new TransformerWeights(Config, _accessor);
         
         State = new RunState(Config);
     }
     
     public void Dispose()
     {
+        // --- ИЗМЕНЕНИЕ ---
+        // Освобождаем ресурсы в правильном порядке.
+        _accessor?.Dispose();
         _mmf?.Dispose();
-        _mmf = null;
         GC.SuppressFinalize(this);
     }
 
@@ -499,7 +506,6 @@ public class Tokenizer
         int id_counter = 0;
         while(reader.BaseStream.Position < reader.BaseStream.Length)
         {
-            // Эта логика чтения теперь точно соответствует C-коду, который может иметь токены без score.
             float score = 0;
             if (reader.BaseStream.Position + sizeof(float) <= reader.BaseStream.Length)
             {
@@ -520,7 +526,6 @@ public class Tokenizer
             }
             else
             {
-                // Токен может быть пустой строкой, как в C-коде
                 tempVocab.Add("");
             }
             tempScores.Add(score);
@@ -531,7 +536,6 @@ public class Tokenizer
         _vocab = tempVocab.ToArray();
         _mergeScores = tempScores.ToArray();
         
-        // Заполняем словарь для быстрого поиска, он нужен в Encode
         _vocabDict = new Dictionary<string, int>();
         for(int i = 0; i < VocabSize; i++)
         {
@@ -563,14 +567,11 @@ public class Tokenizer
     
     public string Decode(int token) => (token >= 0 && token < _vocab.Length) ? _vocab[token] : "";
 
-    // --- ИСПРАВЛЕНИЕ: Полностью переписанный метод Encode ---
-    // Эта реализация теперь точно повторяет логику C-кода, включая обработку
-    // специальных токенов `<...>` и побайтовую обработку остального текста.
     public int[] Encode(string text)
     {
         var tokens = new List<int>();
         var utf8Bytes = Encoding.UTF8.GetBytes(text);
-        var tempBuffer = new byte[2]; // Для одного UTF-8 символа + null
+        var tempBuffer = new byte[2];
 
         for (int i = 0; i < utf8Bytes.Length; i++)
         {
@@ -596,7 +597,7 @@ public class Tokenizer
                     if (_vocabDict.TryGetValue(specialTokenStr, out id))
                     {
                         tokens.Add(id);
-                        i = endTokenPos; // Перемещаем главный указатель
+                        i = endTokenPos;
                         foundSpecialToken = true;
                     }
                 }
@@ -612,14 +613,11 @@ public class Tokenizer
                 }
                 else
                 {
-                    // В С-коде здесь была ошибка, которая добавляла мусор.
-                    // Мы будем просто пропускать неизвестные символы, что безопаснее.
                     Console.WriteLine($"Warning: unknown character byte {utf8Bytes[i]} in input, skipping.");
                 }
             }
         }
 
-        // Цикл слияния BPE (остается без изменений, он был корректен)
         while (tokens.Count >= 2)
         {
             float best_score = -1e10f;
@@ -663,7 +661,7 @@ public class Sampler
     
     public Sampler(int vocabSize, float temperature, float topp, ulong rngSeed)
     {
-        _vocabSize = vocabSize; // Здесь должен быть РЕАЛЬНЫЙ размер словаря
+        _vocabSize = vocabSize;
         _temperature = temperature;
         _topp = topp;
         _rngState = rngSeed;
@@ -708,7 +706,7 @@ public class Sampler
     
     private int SampleTopp(ReadOnlySpan<float> probabilities, float coin)
     {
-        var probIndex = _probIndex.AsSpan(0, _vocabSize); // Используем реальный vocabSize
+        var probIndex = _probIndex.AsSpan(0, _vocabSize);
         int n0 = 0;
         
         float cutoff = (1.0f - _topp) / (_vocabSize - 1);
@@ -748,7 +746,6 @@ public class Sampler
     
     public int Sample(Span<float> logits)
     {
-        // Теперь метод не принимает vocabSize, он использует тот, с которым был создан
         var relevantLogits = logits.Slice(0, _vocabSize);
 
         if (_temperature == 0.0f)
@@ -937,9 +934,6 @@ class Program
             using var transformer = new Transformer(checkpointPath, ctxLength);
             var tokenizer = new Tokenizer(checkpointPath, transformer.Config.vocab_size, enableThinking);
             
-            // --- ИСПРАВЛЕНИЕ: Инициализация Sampler ---
-            // Семплер должен быть инициализирован РЕАЛЬНЫМ размером словаря из токенизатора,
-            // а не "дополненным" размером из конфига модели.
             var sampler = new Sampler(tokenizer.VocabSize, temperature, topp, rngSeed);
 
             if (string.IsNullOrEmpty(prompt))
